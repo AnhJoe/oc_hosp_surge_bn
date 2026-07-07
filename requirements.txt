@@ -1,25 +1,16 @@
-# DS & ML Libraries
-pandas
-numpy
-scipy
-statsmodels
-scikit-learn
-openpyxl
+# R package dependencies for OC SurgeWatch
+# Install with:
+#   install.packages(readLines("requirements.txt")[!grepl("^#|^$", readLines("requirements.txt"))])
 
-# Bayesian Modeling
-pymc
-cmdstanpy
-arviz
-bambi
+# Data wrangling
+tidyverse
+janitor
+readxl
 
-# EDA & Visualization
-matplotlib
-seaborn
-plotly
-missingno
-graphviz
-
-# Jupyter/Colab Support
-ipykernel
-nbformat
-gdown
+# Bayesian modeling
+brms
+tidybayes
+ggdist
+loo
+bayesplot
+pos

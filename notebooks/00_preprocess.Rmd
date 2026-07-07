@@ -1,0 +1,279 @@
+---
+title: "OC SurgeWatch: Bayesian Surge Capacity Analysis for Orange County Hospital Disaster Preparedness"
+author: "Joe T. Nguyen"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Libraries
+
+```{r libraries}
+library(tidyverse)
+library(brms)
+library(tidybayes)
+library(ggdist)
+library(janitor)
+library(readxl)
+library(loo)
+library(bayesplot)
+library(posterior)
+```
+
+---
+
+# Load Data & Identify Schema Shifts
+
+```{r schema_shifts}
+files <- list.files(path = "data", pattern = "pddpivot\\.csv$", full.names = TRUE)
+
+# Snapshot column names by year for key modeling variables
+schema_data <- map_df(files, function(path) {
+  year_val <- as.numeric(str_extract(basename(path), "\\d{4}"))
+  cols <- names(read_csv(path, n_max = 0, show_col_types = FALSE))
+  tibble(year = year_val, variable = cols, present = 1) %>%
+    filter(str_detect(variable, regex(
+      "^(county|oshpd|age_6|age_7|age_8|toc_acute|payer_med|control|licensed)",
+      ignore_case = TRUE
+    )))
+})
+
+# Variables present in some years but not all
+shifters <- schema_data %>%
+  group_by(variable) %>%
+  mutate(year_count = n_distinct(year)) %>%
+  filter(year_count < length(files)) %>%
+  ungroup()
+
+ggplot(shifters, aes(x = factor(year), y = variable)) +
+  geom_tile(aes(fill = factor(present)), color = "white") +
+  scale_fill_manual(values = c("1" = "#e34a33"), guide = "none") +
+  theme_minimal() +
+  labs(
+    title = "HCAI PDD Variable Name Shifts (2018–2024)",
+    subtitle = "Key variables only — red = present that year",
+    x = "Reporting Year", y = "Variable Name"
+  ) +
+  theme(
+    axis.text.y      = element_text(size = 9),
+    panel.grid.major = element_blank(),
+    plot.title       = element_text(face = "bold")
+  )
+```
+
+**Schema notes:**
+
+Primary modeling variables (`toc_acute`, `age_60_69`, `age_70_79`, `age_80_`, `licensed_bed_size`, `OSHPD_ID`, `CONTROL_TYPE_DESC`) are consistently named across all 7 years. Two name shifts require bridging:
+
+- `COUNTY_NAME` → `COUNTY` starting 2021
+- `Payer_Medi_Cal` → `Payer_MediCal` in 2024
+
+Case changes (`LICENSED_BED_SIZE` → `licensed_bed_size`) normalize automatically via `tolower()`.
+
+---
+
+# Preprocess Data
+
+```{r preprocess}
+# Column name bridges applied after tolower()
+hcai_bridge <- c(
+  "county"         = "county_name",  # pre-2021 name
+  "payer_medi_cal" = "payer_medical" # 2024 name
+)
+
+load_pivot_year <- function(path) {
+  df <- read_csv(path, col_types = cols(.default = "c"), show_col_types = FALSE)
+  names(df) <- tolower(names(df))
+  df <- df %>% rename(any_of(tolower(hcai_bridge)))
+  df$data_year <- as.integer(str_extract(basename(path), "\\d{4}"))
+  df %>%
+    select(
+      data_year, oshpd_id, facility_name, county,
+      control_type_desc, licensed_bed_size,
+      any_of(c("toc_acute", "age_60_69", "age_70_79", "age_80_",
+               "payer_medicare", "adm_emergency", "adm_elective", "dsch_days"))
+    )
+}
+
+# Excluded facility types (outside scope of adult acute-care surge analysis):
+#   Pediatric: CHOC, Children's at Mission, Healthbridge
+#   Rehab/LTACH: Kindred Brea, Kindred Westminster, Encompass Health Tustin
+#   Psychiatric/substance abuse: College Hospital CM, Newport Bay, Laguna Treatment, Aliso Ridge
+#   Elective specialty: Hoag Orthopedic Institute
+#   Not a designated ERC: Chapman Global Medical Center
+#   Incomplete panel: Anaheim Community Hospital (only 2022–2024)
+exclude_patterns <- regex(
+  paste(
+    "children", "pediatric", "rehabilitation", "rehab",
+    "psychiatric", "behavioral",
+    "newport bay", "college hospital costa mesa", "laguna treatment",
+    "kindred", "orthopedic", "chapman global", "anaheim community hospital",
+    sep = "|"
+  ),
+  ignore_case = TRUE
+)
+
+pdd_raw <- map(files, load_pivot_year) %>%
+  bind_rows() %>%
+  filter(str_detect(toupper(county), "ORANGE")) %>%
+  filter(!str_detect(facility_name, exclude_patterns)) %>%
+  mutate(across(c(age_60_69, age_70_79, age_80_, toc_acute,
+                  payer_medicare, adm_emergency, adm_elective, dsch_days),
+                ~ as.numeric(.x)))
+
+# Panel coverage audit — grouped by oshpd_id to handle mid-panel renames
+panel_coverage <- pdd_raw %>%
+  group_by(oshpd_id) %>%
+  summarise(
+    facility_name = last(facility_name[order(data_year)]),
+    years_present = n_distinct(data_year),
+    years         = paste(sort(unique(data_year)), collapse = ", "),
+    toc_missing   = sum(is.na(toc_acute) | toc_acute == 0),
+    age_missing   = sum(is.na(age_60_69) | is.na(age_70_79) | is.na(age_80_)),
+    .groups = "drop"
+  ) %>%
+  arrange(years_present, oshpd_id)
+
+cat("=== Panel Coverage Summary ===\n")
+print(panel_coverage, n = Inf)
+
+cat("\nFacilities by year count:\n")
+print(table(panel_coverage$years_present))
+```
+
+---
+
+# Derive Modelling Variables
+
+```{r derive_variables}
+pdd_panel <- pdd_raw %>%
+  mutate(
+    # Time index centered at 2018 (range 0–6)
+    year_idx = data_year - 2018L,
+
+    # Elderly admissions burden (60+)
+    y_60plus     = age_60_69 + age_70_79 + age_80_,
+    share_60plus = y_60plus / toc_acute,
+
+    # Bed capacity midpoint — maps licensed_bed_size category to approximate count
+    bed_midpoint = case_when(
+      licensed_bed_size == "50-99"   ~ 75,
+      licensed_bed_size == "100-149" ~ 125,
+      licensed_bed_size == "150-199" ~ 175,
+      licensed_bed_size == "200-299" ~ 250,
+      licensed_bed_size == "300-499" ~ 400,
+      TRUE ~ NA_real_
+    ),
+
+    # Occupancy rate; capped at 1.0 (values >1 reflect bed midpoint undercounting)
+    occupancy = pmin(dsch_days / (bed_midpoint * 365), 1, na.rm = FALSE),
+
+    # Ownership — EDA only; random effects absorb mid-panel changes
+    ownership = case_when(
+      str_detect(control_type_desc, regex("investor", ignore_case = TRUE))                              ~ "ForProfit",
+      str_detect(control_type_desc, regex("non-profit|church", ignore_case = TRUE))                     ~ "Nonprofit",
+      str_detect(control_type_desc, regex("university|state|city|county|district", ignore_case = TRUE)) ~ "Government",
+      TRUE ~ "Other"
+    ),
+    ownership = factor(ownership, levels = c("Nonprofit", "ForProfit", "Government")),
+
+    emerg_share    = adm_emergency / toc_acute,
+    elective_share = adm_elective  / toc_acute,
+    medicare_share = payer_medicare / toc_acute
+  )
+
+# Report any rows with missing/zero primary outcome
+pdd_panel %>%
+  filter(is.na(toc_acute) | toc_acute == 0) %>%
+  select(data_year, oshpd_id, facility_name, toc_acute) %>%
+  { if (nrow(.) > 0) { cat("Rows dropped (missing/zero toc_acute):\n"); print(.) }
+    else cat("No rows dropped — toc_acute complete.\n") }
+
+pdd_panel <- pdd_panel %>%
+  filter(!is.na(toc_acute), toc_acute > 0)
+
+cat("\n", nrow(pdd_panel), "rows |",
+    n_distinct(pdd_panel$oshpd_id), "facilities\n")
+
+glimpse(pdd_panel)
+```
+
+---
+
+# Data Validation
+
+```{r data_validation_model_vars}
+# Missing value heatmap — core modeling variables
+m_vars <- c("toc_acute", "year_idx", "oshpd_id")
+
+pdd_panel %>%
+  group_by(data_year) %>%
+  summarise(across(all_of(m_vars), ~ mean(is.na(.)))) %>%
+  pivot_longer(-data_year, names_to = "variable", values_to = "pct_missing") %>%
+  mutate(variable = factor(variable, levels = m_vars)) %>%
+  ggplot(aes(x = factor(data_year), y = variable, fill = pct_missing)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "#ef3b2c", labels = scales::percent_format()) +
+  theme_minimal() +
+  labs(
+    title = "Missing Value Density — Core Variables",
+    subtitle = "Primary outcome: toc_acute. All white = zero missing.",
+    x = "Year", y = NULL, fill = "% Missing"
+  )
+```
+
+```{r data_validation_scorecard}
+# Missing value heatmap — scorecard features
+scorecard_vars <- c("y_60plus", "share_60plus", "occupancy",
+                    "emerg_share", "elective_share", "medicare_share")
+
+pdd_panel %>%
+  group_by(data_year) %>%
+  summarise(across(all_of(scorecard_vars), ~ mean(is.na(.)))) %>%
+  pivot_longer(-data_year, names_to = "variable", values_to = "pct_missing") %>%
+  mutate(variable = factor(variable, levels = scorecard_vars)) %>%
+  ggplot(aes(x = factor(data_year), y = variable, fill = pct_missing)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "#ef3b2c", labels = scales::percent_format()) +
+  theme_minimal() +
+  labs(
+    title = "Missing Value Density — Scorecard Feature Variables",
+    subtitle = "occupancy is NA where dsch_days is missing.",
+    x = "Year", y = NULL, fill = "% Missing"
+  )
+```
+
+```{r data_validation_raw_indicators}
+# Missing value heatmap — raw surge and financial indicators
+raw_indicators <- c("payer_medicare", "adm_emergency", "adm_elective", "dsch_days")
+
+pdd_panel %>%
+  group_by(data_year) %>%
+  summarise(across(all_of(raw_indicators), ~ mean(is.na(.)))) %>%
+  pivot_longer(-data_year, names_to = "variable", values_to = "pct_missing") %>%
+  ggplot(aes(x = factor(data_year), y = variable, fill = pct_missing)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "#ef3b2c", labels = scales::percent_format()) +
+  theme_minimal() +
+  labs(
+    title = "Missing Value Density — Raw Surge & Financial Indicators",
+    subtitle = "adm_emergency/adm_elective missingness in 2020–2021 is MNAR (reporting waivers).",
+    x = "Year", y = NULL, fill = "% Missing"
+  )
+```
+
+---
+
+# Save Processed Data
+
+```{r save_processed}
+dir.create("data/processed", showWarnings = FALSE)
+saveRDS(pdd_panel, "data/processed/pdd_panel.rds")
+
+cat("Saved: data/processed/pdd_panel.rds —",
+    nrow(pdd_panel), "rows,",
+    n_distinct(pdd_panel$oshpd_id), "facilities\n")
+```

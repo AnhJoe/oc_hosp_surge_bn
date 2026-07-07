@@ -1,0 +1,579 @@
+---
+title: "Modeling"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Libraries
+
+```{r libraries}
+library(tidyverse)
+library(brms)
+library(tidybayes)
+library(ggdist)
+library(loo)
+library(bayesplot)
+library(posterior)
+
+dir.create("models", showWarnings = FALSE)
+```
+
+------------------------------------------------------------------------
+
+# Load Data
+
+```{r load}
+pdd <- readRDS("data/processed/pdd_panel.rds")
+
+facility_labels <- c(
+  "300225" = "Orange Coast Memorial",
+  "301098" = "Anaheim Regional",
+  "301175" = "UCI Fountain Valley",
+  "301188" = "Anaheim Global",
+  "301205" = "Hoag Newport Beach",
+  "301209" = "Huntington Beach",
+  "301234" = "La Palma",
+  "301248" = "UCI Los Alamitos",
+  "301258" = "South Coast Global",
+  "301262" = "Mission Viejo",
+  "301279" = "UCI Orange",
+  "301283" = "Garden Grove",
+  "301297" = "UCI Placentia Linda",
+  "301317" = "Saddleback",
+  "301337" = "Mission Laguna Beach",
+  "301340" = "St. Joseph",
+  "301342" = "St. Jude",
+  "301357" = "Foothill Regional",
+  "301379" = "West Anaheim",
+  "301566" = "OC Global",
+  "304409" = "Kaiser Anaheim"
+)
+
+pdd <- pdd %>%
+  mutate(facility_label = facility_labels[oshpd_id])
+
+cat(nrow(pdd), "rows |", n_distinct(pdd$oshpd_id), "facilities |",
+    n_distinct(pdd$data_year), "years\n")
+```
+
+------------------------------------------------------------------------
+
+# Prepare Scorecard Features
+
+Baseline averages (2018-2019) for Elderly Share and Occupancy Rate. Z-scored so coefficients are comparable. Using the early baseline as the fixed reference point — in a real-time monitoring system, these would be updated periodically against the same baseline.
+
+```{r scorecard_features}
+scorecard <- pdd %>%
+  filter(data_year %in% c(2018, 2019)) %>%
+  group_by(oshpd_id) %>%
+  summarise(
+    share_60plus_raw = mean(share_60plus, na.rm = TRUE),
+    occupancy_raw    = mean(occupancy,    na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    share_60plus_z = as.numeric(scale(share_60plus_raw)),
+    occupancy_z    = as.numeric(scale(occupancy_raw))
+  )
+
+pdd <- pdd %>%
+  left_join(scorecard %>% select(oshpd_id, share_60plus_z, occupancy_z),
+            by = "oshpd_id")
+
+cat("Scorecard features - baseline means and SDs:\n")
+scorecard %>%
+  summarise(
+    across(ends_with("_raw"),
+           list(mean = ~ round(mean(.), 3), sd = ~ round(sd(.), 3)))
+  )
+```
+
+------------------------------------------------------------------------
+
+# Train / Test Split
+
+Training: 2018-2023 (6 years). Test: 2024 (1 year — held out entirely).
+
+```{r train_test_split}
+train <- pdd %>% filter(data_year <= 2023)
+test  <- pdd %>% filter(data_year == 2024)
+
+cat("Train:", nrow(train), "rows |", n_distinct(train$data_year), "years (",
+    paste(sort(unique(train$data_year)), collapse = ", "), ")\n")
+cat("Test: ", nrow(test),  "rows |", n_distinct(test$data_year),  "years (",
+    paste(sort(unique(test$data_year)),  collapse = ", "), ")\n")
+```
+
+------------------------------------------------------------------------
+
+# Priors
+
+```{r priors}
+# Q1 forecasting model (train only): base — no scorecard features
+priors_base <- c(
+  prior(normal(log(10000), 0.5), class = Intercept),
+  prior(normal(0, 0.05),         class = b, coef = year_idx),
+  prior(normal(0, 0.3),          class = sd),
+  prior(gamma(4, 0.1),           class = shape)
+)
+
+# Q2 forecasting model (train only): scorecard features added
+priors_scorecard <- c(
+  prior(normal(log(10000), 0.5), class = Intercept),
+  prior(normal(0, 0.05),         class = b, coef = year_idx),
+  prior(normal(0, 0.5),          class = b, coef = share_60plus_z),
+  prior(normal(0, 0.5),          class = b, coef = occupancy_z),
+  prior(normal(0, 0.3),          class = sd),
+  prior(gamma(4, 0.1),           class = shape)
+)
+```
+
+------------------------------------------------------------------------
+
+# Prior Predictive Check
+
+```{r prior_check, cache=TRUE}
+m_prior <- brm(
+  toc_acute ~ year_idx + (1 | oshpd_id),
+  data         = train,
+  family       = negbinomial(),
+  prior        = priors_base,
+  sample_prior = "only",
+  chains = 2, iter = 1000, warmup = 500,
+  seed   = 42,
+  file   = "models/m_prior_v2"
+)
+
+yrep <- posterior_predict(m_prior, ndraws = 50)
+yrep_df <- as.data.frame(t(yrep)) %>%
+  pivot_longer(everything(), names_to = "draw", values_to = "value")
+
+ggplot() +
+  geom_density(data = yrep_df, aes(x = value, group = draw),
+               color = "#d7191c", alpha = 0.5, linewidth = 0.3) +
+  geom_density(data = data.frame(value = train$toc_acute), aes(x = value),
+               color = "black", linewidth = 1) +
+  scale_x_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(lineheight = 1.3)) +
+  labs(title    = "Prior Predictive Check",
+       subtitle = "Red = simulated (prior only); black = observed (train).\nSimulated outcomes should bracket the observed range without blowing up.",
+       x = "Total Acute Admissions", y = "Density")
+```
+
+------------------------------------------------------------------------
+
+# Q1: Facility Vulnerability Forecasting — Base Model
+
+Fit on 2018-2023. Facility random intercepts capture baseline size differences. No scorecard features — this is the baseline predictive model.
+
+```{r m_base, cache=TRUE}
+m_base <- brm(
+  toc_acute ~ year_idx + (1 | oshpd_id),
+  data    = train,
+  family  = negbinomial(),
+  prior   = priors_base,
+  chains  = 4, iter = 3000, warmup = 1500,
+  control = list(adapt_delta = 0.95),
+  seed    = 42,
+  file    = "models/m_base_v3"
+)
+
+summary(m_base)
+```
+
+------------------------------------------------------------------------
+
+# Q2: Facility Vulnerability Forecasting — Scorecard Model
+
+Same structure as m_base but adds baseline occupancy rate and elderly share as fixed predictors. Tests whether structural facility characteristics improve our ability to forecast which facilities are under the most demand pressure.
+
+```{r m_scorecard, cache=TRUE}
+m_scorecard <- brm(
+  toc_acute ~ year_idx + share_60plus_z + occupancy_z + (1 | oshpd_id),
+  data    = train,
+  family  = negbinomial(),
+  prior   = priors_scorecard,
+  chains  = 4, iter = 3000, warmup = 1500,
+  control = list(adapt_delta = 0.95),
+  seed    = 42,
+  file    = "models/m_scorecard_v3"
+)
+
+summary(m_scorecard)
+
+# Feature coefficients — practical interpretation
+m_scorecard %>%
+  spread_draws(b_share_60plus_z, b_occupancy_z) %>%
+  pivot_longer(starts_with("b_"), names_to = "feature", values_to = "estimate") %>%
+  mutate(
+    feature    = recode(feature,
+                        "b_share_60plus_z" = "Elderly Share (60+)",
+                        "b_occupancy_z"    = "Occupancy Rate"),
+    pct_change = (exp(estimate) - 1) * 100
+  ) %>%
+  group_by(feature) %>%
+  median_qi(pct_change, .width = 0.90) %>%
+  mutate(across(where(is.numeric), ~ round(., 1))) %>%
+  transmute(
+    Feature                   = feature,
+    `Effect per 1-SD (median)` = paste0(pct_change, "%"),
+    `90% Lower`               = paste0(.lower, "%"),
+    `90% Upper`               = paste0(.upper, "%")
+  )
+```
+
+```{r scorecard_coef_plot}
+# Posterior distributions of scorecard feature effects (% change in admissions per 1-SD)
+m_scorecard %>%
+  spread_draws(b_share_60plus_z, b_occupancy_z) %>%
+  pivot_longer(starts_with("b_"), names_to = "feature", values_to = "estimate") %>%
+  mutate(
+    feature    = recode(feature,
+                        "b_share_60plus_z" = "Elderly Share (60+)",
+                        "b_occupancy_z"    = "Occupancy Rate"),
+    pct_change = (exp(estimate) - 1) * 100
+  ) %>%
+  ggplot(aes(x = pct_change, y = feature, fill = feature)) +
+  stat_halfeye(.width = c(0.50, 0.90), point_interval = median_qi,
+               alpha = 0.85, normalize = "panels") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30", linewidth = 0.7) +
+  scale_fill_manual(values = c("Elderly Share (60+)" = "#2c7bb6",
+                               "Occupancy Rate"       = "#d7191c")) +
+  theme_minimal() +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(lineheight = 1.3),
+        legend.position = "none") +
+  labs(
+    title    = "Scorecard Feature Effects on Annual Admissions",
+    subtitle = "Posterior distribution of % change in admissions per 1-SD increase in each feature.\nInner bar = 50% credible interval; outer bar = 90% credible interval. \nDashed line = no effect.",
+    x = "% Change in Admissions per 1-SD", y = NULL
+  )
+```
+
+------------------------------------------------------------------------
+
+# Convergence Checks
+
+```{r convergence}
+models <- list(Base = m_base, Scorecard = m_scorecard)
+
+map_df(names(models), function(nm) {
+  draws     <- as_draws_df(models[[nm]])
+  rhat_vals <- summarise_draws(draws, rhat)$rhat
+  ess_vals  <- summarise_draws(draws, ess_bulk)$ess_bulk
+  tibble(
+    Model        = nm,
+    max_rhat     = round(max(rhat_vals, na.rm = TRUE), 3),
+    min_ess_bulk = round(min(ess_vals,  na.rm = TRUE))
+  )
+})
+```
+
+------------------------------------------------------------------------
+
+# Posterior Predictive Evaluation on Test Set (2024)
+
+Compare m_base and m_scorecard predictions against held-out actuals. Coverage: what % of actuals fall within the 90% posterior predictive interval. RMSE: root mean squared error on point estimates (posterior median).
+
+```{r ppc_test}
+pred_base      <- posterior_predict(m_base,      newdata = test)
+pred_scorecard <- posterior_predict(m_scorecard, newdata = test)
+
+eval_model <- function(pred_mat, label) {
+  test %>%
+    mutate(
+      pred_median = apply(pred_mat, 2, median),
+      pred_lower  = apply(pred_mat, 2, quantile, 0.05),
+      pred_upper  = apply(pred_mat, 2, quantile, 0.95),
+      residual    = toc_acute - pred_median,
+      covered     = toc_acute >= pred_lower & toc_acute <= pred_upper,
+      model       = label
+    )
+}
+
+eval_base      <- eval_model(pred_base,      "Base")
+eval_scorecard <- eval_model(pred_scorecard, "Scorecard")
+
+# Summary metrics
+bind_rows(eval_base, eval_scorecard) %>%
+  group_by(model) %>%
+  summarise(
+    `90% PI Coverage` = scales::percent(mean(covered), accuracy = 0.1),
+    RMSE              = round(sqrt(mean(residual^2))),
+    MAE               = round(mean(abs(residual))),
+    .groups = "drop"
+  )
+```
+
+```{r ppc_test_plot}
+# Predicted vs actual by facility
+bind_rows(eval_base, eval_scorecard) %>%
+  mutate(data_year = factor(data_year)) %>%
+  ggplot(aes(x = pred_median, y = toc_acute, color = model)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_color_manual(values = c("Base" = "#2c7bb6", "Scorecard" = "#d7191c")) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(lineheight = 1.3)) +
+  labs(
+    title    = "Predicted vs Actual Acute Admissions — Test Set (2024)",
+    subtitle = "Points on the dashed line = perfect prediction.\nScatter above/below = over/under-prediction per facility-year.",
+    x = "Predicted (posterior median)", y = "Actual", color = "Model"
+  )
+```
+
+```{r ppc_interval_plot}
+# Per-facility 90% PI plot — shows coverage and direction of error
+eval_scorecard %>%
+  mutate(
+    facility_label = fct_reorder(facility_label, pred_median),
+    covered        = toc_acute >= pred_lower & toc_acute <= pred_upper
+  ) %>%
+  ggplot(aes(y = facility_label)) +
+  geom_segment(aes(x = pred_lower, xend = pred_upper, yend = facility_label),
+               color = "grey70", linewidth = 1) +
+  geom_point(aes(x = pred_median), color = "#d7191c", size = 2.5) +
+  geom_point(aes(x = toc_acute, shape = covered), size = 2.5, color = "black") +
+  scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 4),
+                     labels = c("TRUE" = "Inside PI", "FALSE" = "Outside PI")) +
+  scale_x_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(lineheight = 1.3),
+        legend.position = "bottom") +
+  labs(
+    title    = "Posterior Credible Intervals vs Actuals — Test Set (2024)",
+    subtitle = "Red dot = predicted median; black dot = actual 2024 admissions.\nFilled circle = actual falls inside 90% CI; X = outside. \nScorecard model, all 21 facilities.",
+    x = "Annual Admissions", y = NULL, shape = "Actual"
+  )
+```
+
+```{r ppc_residuals_plot}
+# Residuals by facility — signed error (actual - predicted)
+eval_scorecard %>%
+  mutate(
+    facility_label = fct_reorder(facility_label, residual),
+    direction      = if_else(residual >= 0, "Under-predicted", "Over-predicted")
+  ) %>%
+  ggplot(aes(x = residual, y = facility_label, fill = direction)) +
+  geom_col(width = 0.6) +
+  geom_vline(xintercept = 0, linewidth = 0.8, color = "grey30") +
+  scale_x_continuous(labels = scales::comma) +
+  scale_fill_manual(values = c("Under-predicted" = "#d7191c", "Over-predicted" = "#2c7bb6")) +
+  theme_minimal() +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(lineheight = 1.3),
+        legend.position = "bottom") +
+  labs(
+    title    = "Forecast Residuals by Facility — Test Set (2024)",
+    subtitle = "Residual = actual - predicted median. Red = model undershot actual volume; blue = model overshot.\nLarge positive residuals flag facilities the model systematically underestimates.",
+    x = "Residual (Actual - Predicted)", y = NULL, fill = NULL
+  )
+```
+
+------------------------------------------------------------------------
+
+# Q2: Feature Contribution to Predictive Accuracy
+
+LOO comparison of m_base vs m_scorecard on the training data. Positive elpd_diff for Scorecard = scorecard features improve prediction.
+
+```{r feature_contribution}
+loo_base      <- loo(m_base)
+loo_scorecard <- loo(m_scorecard)
+
+loo_compare(loo_base, loo_scorecard)
+```
+
+------------------------------------------------------------------------
+
+# Q1: Facility Vulnerability Rankings (2024)
+
+Facilities ranked by predicted 2024 acute admissions volume (posterior median). Higher predicted volume + higher baseline occupancy = greater surge exposure. The 90% posterior predictive interval reflects forecast uncertainty per facility.
+
+```{r vulnerability_rankings}
+vulnerability <- eval_scorecard %>%
+  group_by(facility_label) %>%
+  summarise(
+    pred_median   = mean(pred_median),
+    pred_lower    = mean(pred_lower),
+    pred_upper    = mean(pred_upper),
+    actual_mean   = mean(toc_acute),
+    residual_mean = mean(residual),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    scorecard %>%
+      mutate(facility_label = facility_labels[as.character(oshpd_id)]) %>%
+      select(facility_label, occupancy_raw, share_60plus_raw),
+    by = "facility_label"
+  ) %>%
+  mutate(
+    occupancy_tier = case_when(
+      occupancy_raw >= quantile(occupancy_raw, 0.67, na.rm = TRUE) ~ "High",
+      occupancy_raw >= quantile(occupancy_raw, 0.33, na.rm = TRUE) ~ "Medium",
+      TRUE ~ "Low"
+    ),
+    occupancy_tier = factor(occupancy_tier, levels = c("High", "Medium", "Low")),
+    facility_label = fct_reorder(facility_label, pred_median)
+  ) %>%
+  arrange(desc(pred_median))
+
+ggplot(vulnerability, aes(x = pred_median, y = facility_label)) +
+  geom_segment(aes(x = pred_lower, xend = pred_upper, yend = facility_label),
+               color = "grey70", linewidth = 0.8) +
+  geom_point(aes(color = occupancy_tier), size = 3) +
+  geom_point(aes(x = actual_mean), shape = 4, size = 2, color = "black") +
+  scale_color_manual(values = c("High" = "#d7191c", "Medium" = "#fdae61",
+                                "Low"  = "#2c7bb6")) +
+  scale_x_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(lineheight = 1.3)) +
+  labs(
+    title    = "Facility Vulnerability Rankings — Predicted 2024 Volume",
+    subtitle = "Line = 90% posterior predictive interval; dot = predicted median; x = actual (2024).\nModel underpredicts the highest-volume facilities (actuals fall right of interval).\nColor = baseline occupancy tier (2018-2019). High occupancy + high volume = greatest surge exposure.",
+    x = "Predicted Annual Acute Admissions", y = NULL,
+    color = "Baseline\nOccupancy"
+  )
+
+# Summary table
+vulnerability %>%
+  arrange(desc(pred_median)) %>%
+  mutate(
+    across(c(pred_median, pred_lower, pred_upper, actual_mean), ~ round(., 0)),
+    residual_mean    = round(residual_mean, 0),
+    occupancy_raw    = scales::percent(occupancy_raw, accuracy = 0.1),
+    share_60plus_raw = scales::percent(share_60plus_raw, accuracy = 0.1)
+  ) %>%
+  select(facility_label, pred_median, pred_lower, pred_upper,
+         actual_mean, residual_mean, occupancy_raw, share_60plus_raw, occupancy_tier) %>%
+  rename(
+    Facility         = facility_label,
+    `Pred Median`    = pred_median,
+    `90% Lower`      = pred_lower,
+    `90% Upper`      = pred_upper,
+    `Actual Mean`    = actual_mean,
+    `Residual`       = residual_mean,
+    `Occupancy`      = occupancy_raw,
+    `60+ Share`      = share_60plus_raw,
+    `Occupancy Tier` = occupancy_tier
+  )
+```
+
+------------------------------------------------------------------------
+
+# Practical Monitoring Framework
+
+The scorecard model supports a real-time or batch vulnerability monitoring workflow. A facility is flagged as critical when its predicted annual admissions exceed the volume corresponding to 95% bed occupancy, derived from its own licensed bed size and average length of stay (2018-2023).
+
+Capacity threshold per facility: ALOS_j = discharge_days_j / toc_acute_j (avg days per admission) threshold_j = (bed_midpoint_j x 365 x 0.95) / ALOS_j (admissions at 95% occupancy)
+
+```{r monitoring_framework}
+# Step 1: compute facility-specific ALOS from full training period (2018-2023)
+alos_train <- train %>%
+  group_by(oshpd_id, facility_label) %>%
+  summarise(
+    alos         = mean(dsch_days / toc_acute, na.rm = TRUE),
+    bed_midpoint = mean(bed_midpoint,          na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Annual admissions at which facility hits 95% licensed bed occupancy
+    capacity_threshold = (bed_midpoint * 365 * 0.95) / alos
+  )
+
+cat("Facility-specific capacity thresholds (95% occupancy):\n")
+alos_train %>%
+  mutate(
+    alos               = round(alos, 1),
+    bed_midpoint       = round(bed_midpoint),
+    capacity_threshold = round(capacity_threshold)
+  ) %>%
+  arrange(desc(capacity_threshold)) %>%
+  select(facility_label, bed_midpoint, alos, capacity_threshold) %>%
+  rename(
+    Facility    = facility_label,
+    `Beds`      = bed_midpoint,
+    `ALOS`      = alos,
+    `Threshold` = capacity_threshold
+  ) %>%
+  print(n = Inf)
+
+# Step 2: construct forecast data (next year beyond test)
+new_data <- test %>%
+  filter(data_year == max(data_year)) %>%
+  mutate(year_idx = max(year_idx) + 1)
+
+# Step 3: posterior predictive distribution for each facility
+pred_new <- posterior_predict(m_scorecard, newdata = new_data)
+
+# Step 4: P(admissions > facility-specific 95% capacity threshold)
+surge_risk <- new_data %>%
+  left_join(alos_train %>% select(oshpd_id, capacity_threshold),
+            by = "oshpd_id") %>%
+  mutate(
+    pred_median = apply(pred_new, 2, median),
+    pred_lower  = apply(pred_new, 2, quantile, 0.05),
+    pred_upper  = apply(pred_new, 2, quantile, 0.95),
+    p_critical  = map_dbl(seq_len(n()),
+                          ~ mean(pred_new[, .x] > capacity_threshold[.x]))
+  ) %>%
+  arrange(desc(p_critical))
+
+surge_risk %>%
+  mutate(
+    pred_median        = scales::comma(round(pred_median)),
+    capacity_threshold = scales::comma(round(capacity_threshold)),
+    p_critical         = scales::percent(p_critical, accuracy = 0.1)
+  ) %>%
+  rename(
+    Facility            = facility_label,
+    `Predicted Volume`  = pred_median,
+    `95% Cap Threshold` = capacity_threshold,
+    `P(Critical)`       = p_critical
+  ) %>%
+  select(Facility, `Predicted Volume`, `95% Cap Threshold`, `P(Critical)`)
+```
+
+```{r monitoring_plot}
+surge_risk %>%
+  filter(p_critical > 0) %>%
+  mutate(
+    facility_label = fct_reorder(facility_label, p_critical),
+    alert_tier     = case_when(
+      p_critical >= 0.50 ~ "Critical (>= 50%)",
+      p_critical >= 0.20 ~ "Elevated (20-49%)",
+      TRUE               ~ "Watch (< 20%)"
+    ),
+    alert_tier = factor(alert_tier,
+                        levels = c("Critical (>= 50%)", "Elevated (20-49%)", "Watch (< 20%)"))
+  ) %>%
+  ggplot(aes(x = p_critical, y = facility_label, fill = alert_tier)) +
+  geom_col(width = 0.6) +
+  geom_vline(xintercept = 0.50, linetype = "dashed", color = "grey30", linewidth = 0.7) +
+  geom_text(aes(label = scales::percent(p_critical, accuracy = 0.1)),
+            hjust = -0.15, size = 3.2, color = "grey20") +
+  scale_x_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = c(
+    "Critical (>= 50%)"  = "#d7191c",
+    "Elevated (20-49%)"  = "#fdae61",
+    "Watch (< 20%)"      = "#abd9e9"
+  )) +
+  theme_minimal() +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(lineheight = 1.3),
+        legend.position = "bottom") +
+  labs(
+    title    = "Surge Risk Monitor — P(Exceeding 95% Capacity) by Facility",
+    subtitle = "Probability that forecasted admissions exceed the facility-specific 95% \n bed occupancy threshold. Dashed line = 50% critical threshold. \n Only facilities with P(Critical) > 0 shown.",
+    x = "P(Critical)", y = NULL, fill = "Alert Tier"
+  )
+```

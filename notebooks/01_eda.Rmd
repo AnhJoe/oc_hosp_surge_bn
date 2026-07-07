@@ -5,6 +5,7 @@ output: html_notebook
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
 ```
 
 # Libraries
@@ -362,4 +363,3 @@ pdd %>%
 - **Elderly Share and Medicare Share are r = 0.92.** Expected correlation, not near-identity. These two variables are measuring essentially the same thing — older patients are disproportionately on Medicare.
 
 - Q2 (how did COVID stress the system?) has a more nuanced answer than anticipated: the aggregate effect is small, but facility-level divergence is large and worth explaining. The action is in Q1 and Q3 — which facilities diverged most, and what predicted it.
-        

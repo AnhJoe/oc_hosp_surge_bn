@@ -13,4 +13,7 @@ tidybayes
 ggdist
 loo
 bayesplot
-pos
+posterior
+
+# Reporting
+knitr
